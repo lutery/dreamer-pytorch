@@ -11,14 +11,36 @@ from torch.nn import functional as F
 
 # Wraps the input tuple for a function to process a time x batch x features sequence in batch x features (assumes one output)
 def bottle(f, x_tuple):
+    '''
+    方法的作用是将输入的时间序列数据从 (time, batch, features) 的形状转换为 (batch * time, features) 的形状，以便于在神经网络中进行批处理操作，然后再将输出转换回原来的形状 (time, batch, features)。
+    '''
+    # map(lambda x: x.size(), x_tuple) 为获取x_tuple中每个元素的size=(time, batch, features): x_sizes
     x_sizes = tuple(map(lambda x: x.size(), x_tuple))
+    # x[1][0]=time, x[1][1]=batch, x[1][2]=features
+    # (time, batch, features) 的形状转换为 (batch * time, features)
+    # 再传入encoder中
+    # shape of x_tuple: (time, batch, embeddin_features)
     y = f(*map(lambda x: x[0].view(x[1][0] * x[1][1], *x[1][2:]), zip(x_tuple, x_sizes)))
     y_size = y.size()
+    # (batch * time, features) 的形状转换为 (time, batch, embeddin_features)
     output = y.view(x_sizes[0][0], x_sizes[0][1], *y_size[1:])
     return output
 
 
 class TransitionModel(jit.ScriptModule):
+    '''
+    Dreamer 算法中的一个关键组件，它用于预测环境状态的转移。具体来说，TransitionModel 的作用包括：
+
+    状态转移预测：
+
+    根据当前的隐状态（latent state）和动作，预测下一个隐状态。这是通过一个递归神经网络（如 LSTM 或 GRU）来实现的。
+    隐状态的先验和后验分布：
+
+    计算隐状态的先验分布（prior distribution）和后验分布（posterior distribution）。先验分布是基于当前隐状态和动作预测的，而后验分布则结合了实际观察到的环境状态。
+    生成模型：
+
+    作为生成模型的一部分，TransitionModel 与 ObservationModel 和 RewardModel 一起工作，用于生成未来的观察值和奖励。这对于模型的训练和规划（planning）非常重要。
+    '''
     __constants__ = ['min_std_dev']
 
     def __init__(
@@ -31,6 +53,14 @@ class TransitionModel(jit.ScriptModule):
         activation_function='relu',
         min_std_dev=0.1,
     ):
+        '''
+        belief_size：信念状态的大小。
+        state_size：隐状态的大小。
+        action_size：动作的大小。
+        hidden_size：隐藏层的大小。
+        embedding_size：嵌入层的大小。
+        dense_activation_function：密集层的激活函数。
+        '''
         super().__init__()
         self.act_fn = getattr(F, activation_function)
         self.min_std_dev = min_std_dev
@@ -68,12 +98,20 @@ class TransitionModel(jit.ScriptModule):
         nonterminals: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         '''
+        prev_state: 上一个隐状态
+        actions: 动作，没有传入最后一个动作，shape=(time - 1, batch, action_size)
+        prev_belief: 上一个信念状态
+        observations: 观察值，没有传入第一个观察值，shape=(1:time， batch, observation_size)
+        nonterminals: 非终止状态没有传入最后一个中止符号，shape=(time - 1, batch, 1)
         Input: init_belief, init_state:  torch.Size([50, 200]) torch.Size([50, 30])
         Output: beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs
                 torch.Size([49, 50, 200]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30])
         '''
         # Create lists for hidden states (cannot use single tensor as buffer because autograd won't work with inplace writes)
+        # 得到时间步长度
         T = actions.size(0) + 1
+        # 初始化隐状态prior为先验，posterior为后验
+        # 初始化隐藏状态列表，用于存储每个时间步的信念状态、先验状态、先验均值、先验标准差、后验状态、后验均值和后验标准差
         beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = (
             [torch.empty(0)] * T,
             [torch.empty(0)] * T,
@@ -86,13 +124,16 @@ class TransitionModel(jit.ScriptModule):
         beliefs[0], prior_states[0], posterior_states[0] = prev_belief, prev_state, prev_state
         # Loop over time sequence
         for t in range(T - 1):
+            # todo 为啥要这么选择？
             _state = (
                 prior_states[t] if observations is None else posterior_states[t]
             )  # Select appropriate previous state
+            # 根据中止是否有值，选择是否mask
             _state = (
                 _state if nonterminals is None else _state * nonterminals[t]
             )  # Mask if previous transition was terminal
             # Compute belief (deterministic hidden state)
+            # 根据状态（前一个状态）和动作（当前动作）提取特征
             hidden = self.act_fn(self.fc_embed_state_action(torch.cat([_state, actions[t]], dim=1)))
             beliefs[t + 1] = self.rnn(hidden, beliefs[t])
             # Compute state prior by applying transition dynamics
@@ -128,7 +169,27 @@ class TransitionModel(jit.ScriptModule):
 
 
 class SymbolicObservationModel(jit.ScriptModule):
+    '''
+    是 Dreamer 算法中的一个关键组件，它用于从隐状态（latent state）和信念状态（belief state）生成观察值（observations）。具体来说，ObservationModel 的作用包括：
+
+生成观察值：
+
+根据给定的隐状态和信念状态，生成对应的观察值。这通常通过一个神经网络来实现，该网络将隐状态和信念状态作为输入，并输出预测的观察值。
+重建误差计算：
+
+在训练过程中，ObservationModel 用于计算重建误差（reconstruction error），即模型生成的观察值与实际观察值之间的差异。这种误差用于指导模型的训练，使其能够更准确地预测环境的状态。
+作为生成模型的一部分：
+
+ObservationModel 与 TransitionModel 和 RewardModel 一起工作，构成了 Dreamer 算法的生成模型。生成模型用于在隐空间中进行模拟和规划，从而指导智能体的行为。
+    '''
     def __init__(self, observation_size, belief_size, state_size, embedding_size, activation_function='relu'):
+        '''
+        observation_size：观察值的大小。
+        belief_size：信念状态的大小。
+        state_size：隐状态的大小。
+        embedding_size：嵌入层的大小。
+        cnn_activation_function：卷积层的激活函数。
+        '''
         super().__init__()
         self.act_fn = getattr(F, activation_function)
         self.fc1 = nn.Linear(belief_size + state_size, embedding_size)
@@ -177,7 +238,26 @@ def ObservationModel(symbolic, observation_size, belief_size, state_size, embedd
 
 
 class RewardModel(jit.ScriptModule):
+    '''
+     Dreamer 算法中的一个关键组件，它用于从隐状态（latent state）和信念状态（belief state）生成奖励值（rewards）。具体来说，RewardModel 的作用包括：
+
+    生成奖励值：
+
+    根据给定的隐状态和信念状态，生成对应的奖励值。这通常通过一个神经网络来实现，该网络将隐状态和信念状态作为输入，并输出预测的奖励值。
+    奖励预测误差计算：
+
+    在训练过程中，RewardModel 用于计算奖励预测误差（reward prediction error），即模型生成的奖励值与实际奖励值之间的差异。这种误差用于指导模型的训练，使其能够更准确地预测环境的奖励。
+    作为生成模型的一部分：
+
+    RewardModel 与 TransitionModel 和 ObservationModel 一起工作，构成了 Dreamer 算法的生成模型。生成模型用于在隐空间中进行模拟和规划，从而指导智能体的行为。
+    '''
     def __init__(self, belief_size, state_size, hidden_size, activation_function='relu'):
+        '''
+        belief_size：信念状态的大小。
+        state_size：隐状态的大小。
+        hidden_size：隐藏层的大小。
+        dense_activation_function：密集层的激活函数。
+        '''
         # [--belief-size: 200, --hidden-size: 200, --state-size: 30]
         super().__init__()
         self.act_fn = getattr(F, activation_function)
@@ -196,7 +276,23 @@ class RewardModel(jit.ScriptModule):
 
 
 class ValueModel(jit.ScriptModule):
+    '''
+    是价值网络，用于估计给定状态的价值。它的主要作用包括：
+
+    价值估计：
+
+    根据当前的信念状态（belief state）和隐状态（latent state），估计对应状态的价值。这通常通过一个神经网络来实现，该网络将信念状态和隐状态作为输入，并输出状态的价值。
+    价值优化：
+
+    在训练过程中，ValueModel 通过最小化价值估计误差来优化价值函数。它使用从环境中采样的数据和模型生成的数据来更新价值参数。
+    '''
     def __init__(self, belief_size, state_size, hidden_size, activation_function='relu'):
+        '''
+        belief_size：信念状态的大小。
+        state_size：隐状态的大小。
+        hidden_size：隐藏层的大小。
+        dense_activation_function：密集层的激活函数
+        '''
         super().__init__()
         self.act_fn = getattr(F, activation_function)
         self.fc1 = nn.Linear(belief_size + state_size, hidden_size)
@@ -216,6 +312,16 @@ class ValueModel(jit.ScriptModule):
 
 
 class ActorModel(jit.ScriptModule):
+    '''
+    策略网络，用于生成智能体在给定状态下的动作。它的主要作用包括：
+
+    动作生成：
+
+    根据当前的信念状态（belief state）和隐状态（latent state），生成对应的动作。这通常通过一个神经网络来实现，该网络将信念状态和隐状态作为输入，并输出动作的均值和标准差。
+    策略优化：
+
+    在训练过程中，ActorModel 通过最大化预期回报来优化策略。它使用从环境中采样的数据和模型生成的数据来更新策略参数。
+    '''
     def __init__(
         self,
         belief_size,
@@ -228,6 +334,13 @@ class ActorModel(jit.ScriptModule):
         init_std=5,
         mean_scale=5,
     ):
+        '''
+        belief_size：信念状态的大小。
+        state_size：隐状态的大小。
+        hidden_size：隐藏层的大小。
+        action_size：动作的大小。
+        dense_activation_function：密集层的激活函数
+        '''
         super().__init__()
         self.act_fn = getattr(F, activation_function)
         self.fc1 = nn.Linear(belief_size + state_size, hidden_size)
@@ -270,7 +383,22 @@ class ActorModel(jit.ScriptModule):
 
 
 class SymbolicEncoder(jit.ScriptModule):
+    '''
+    是 Dreamer 算法中的一个组件，用于对符号表示的观察值进行编码。具体来说，SymbolicEncoder 的作用包括：
+
+    特征提取：
+
+    将符号表示的观察值（通常是低维的数值特征）转换为高维的嵌入表示（embedding）。这通常通过一系列全连接层（fully connected layers）来实现。
+    输入预处理：
+
+    在 Dreamer 算法中，观察值可以是符号表示的（如数值特征）或视觉表示的（如图像）。SymbolicEncoder 主要用于处理符号表示的观察值。它通过一系列全连接层（fully connected layers）将原始的符号观察值转换为高维的嵌入表示。这种嵌入表示可以更好地捕捉观察值中的重要特征，并作为后续模型（如 TransitionModel 和 ObservationModel）的输入
+    '''
     def __init__(self, observation_size, embedding_size, activation_function='relu'):
+        '''
+        observation_size：观察值的大小。
+        embedding_size：嵌入层的大小。
+        activation_function：激活函数（默认为 ReLU）。
+        '''
         super().__init__()
         self.act_fn = getattr(F, activation_function)
         self.fc1 = nn.Linear(observation_size, embedding_size)

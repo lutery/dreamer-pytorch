@@ -45,10 +45,20 @@ CONTROL_SUITE_ACTION_REPEATS = {
 
 
 # Preprocesses an observation inplace (from float32 Tensor [0, 255] to [-0.5, 0.5])
+# 如果是rgb图像，将图像转换为灰度图像，然后将图像的像素值转换为[-0.5, 0.5]之间
 def preprocess_observation_(observation, bit_depth):
+    '''
+    observation: 观察rgb图像
+    bit_depth: 图像的位深度，比如8位深图等
+    '''
+    # 将图像转换为[-0.5, 0.5]
     observation.div_(2 ** (8 - bit_depth)).floor_().div_(2**bit_depth).sub_(
         0.5
     )  # Quantise to given bit depth and centre
+
+    # 对量化后的图像增加一个随机噪声
+    # todo
+    # observation.add_(torch.rand_like(observation).div_(2**bit_depth))：在量化后的值上加上一个随机噪声，噪声的范围是 [0, 1 / 2**bit_depth]，这相当于对量化后的值进行去量化处理，使其更接近连续图像的概率密度函数（PDF）。
     observation.add_(
         torch.rand_like(observation).div_(2**bit_depth)
     )  # Dequantise (to approx. match likelihood of PDF of continuous images vs. PMF of discrete images)
@@ -150,7 +160,17 @@ class ControlSuiteEnv:
 
 class GymEnv:
     def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
+        '''
+        env (str): 环境名称，
+        symbolic (bool): 是否使用符号表示的观察值。
+        seed (int): 随机种子，用于环境的随机性控制。
+        max_episode_length (int): 每个 episode 的最大步数。
+        action_repeat (int): 每个动作重复执行的次数。
+        bit_depth (int): 图像的位深度，用于图像预处理。
+        '''
+
         import gym
+        # 创建gym环境没有特殊的地方，直接调用gym.make(env)即可
 
         self.symbolic = symbolic
         self._env = gym.make(env)

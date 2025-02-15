@@ -60,7 +60,9 @@ parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', hel
 parser.add_argument('--episodes', type=int, default=1000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=5, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
+# 采集数据时要同时采集多少个环境数据
 parser.add_argument('--batch-size', type=int, default=50, metavar='B', help='Batch size')
+# 每个环境序列采集的长度
 parser.add_argument('--chunk-size', type=int, default=50, metavar='L', help='Chunk size')
 parser.add_argument(
     '--worldmodel-LogProbLoss',
@@ -119,10 +121,12 @@ parser.add_argument('--models', type=str, default='', metavar='M', help='Load mo
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
 args = parser.parse_args()
+# todo overshooting_distance的作用时什么
 args.overshooting_distance = min(
     args.chunk_size, args.overshooting_distance
 )  # Overshooting distance cannot be greater than chunk size
 print(' ' * 26 + 'Options')
+# 打印参数
 for k, v in vars(args).items():
     print(' ' * 26 + k + ': ' + str(v))
 
@@ -139,6 +143,8 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
     print("using CPU")
     args.device = torch.device('cpu')
+# metrics['episodes']：记录了每个 episode 的编号。例如，如果已经完成了 10 个 episode，那么 metrics['episodes'] 的值可能是 [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+# metrics['steps']：记录了每个 episode 结束时的累计步数。例如，如果每个 episode 的步数分别是 100, 200, 150, ...，那么 metrics['steps'] 的值可能是 [100, 300, 450, ...]
 metrics = {
     'steps': [],
     'episodes': [],
@@ -157,16 +163,35 @@ writer = SummaryWriter(summary_name.format(args.env, args.id))
 print("writer is ready")
 
 # Initialise training environment and experience replay memory
+# todo 先只看gym环境
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
 print("environment is loaded")
 if args.experience_replay != '' and os.path.exists(args.experience_replay):
+    # 非必需
+    '''
+    经验回放（Experience Replay）并不是 Dreamer 算法的核心要求，因为 Dreamer 主要依靠构建环境的世界模型，再利用模型进行想象（imagination）来生成训练数据。然而，这里加上 Experience Replay 的原因包括：
+
+    1. **数据高效性**  
+    经验回放允许重复利用已经采集的真实交互数据，从而提高样本利用率，对训练更稳定有帮助。
+
+    2. **降低数据相关性**  
+    将收集到的经验存入缓冲区，再随机采样批次训练能够打破时间相关性，使训练数据更独立。
+
+    3. **稳定性与收敛性**  
+    在实际应用中，即使是模型基的 RL 算法，通过 Replay Buffer 可以平滑环境噪声，提高训练的稳定性。
+
+    总结来说，虽然 Dreamer 本身可以利用从模型想象所得的数据进行训练，但现实中引入经验回放可以更充分利用真实数据，加速和稳定模型学习。
+    '''
     D = torch.load(args.experience_replay)
     metrics['steps'], metrics['episodes'] = [D.steps] * D.episodes, list(range(1, D.episodes + 1))
 elif not args.test:
+    # 构建经验回放缓冲区
     D = ExperienceReplay(
         args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.bit_depth, args.device
     )
     # Initialise dataset D with S random seed episodes
+    # 初始化预热经验重放缓存中，使用随机策略采集 seed_episodes 个序列数据
+    # 并记录每个序列的部署
     for s in range(1, args.seed_episodes + 1):
         observation, done, t = env.reset(), False, 0
         while not done:
@@ -181,6 +206,7 @@ print("experience replay buffer is ready")
 
 
 # Initialise model parameters randomly
+# todo 什么事belief_size
 transition_model = TransitionModel(
     args.belief_size,
     args.state_size,
@@ -245,6 +271,9 @@ if args.algo == "dreamer":
     print("DREAMER")
     planner = actor_model
 else:
+    '''
+    todo 这段先不看
+    '''
     print("PLANET")
     planner = MPCPlanner(
         env.action_size,
@@ -255,10 +284,14 @@ else:
         transition_model,
         reward_model,
     )
+
+# 一个全局的先验分布，用于计算 KL 散度。它通常被设定为标准正态分布（均值为 0，方差为 1）。在 Dreamer 算法中，global_prior 用于计算全局 KL 散度损失，从而帮助模型在训练过程中保持稳定。
 global_prior = Normal(
     torch.zeros(args.batch_size, args.state_size, device=args.device),
     torch.ones(args.batch_size, args.state_size, device=args.device),
 )  # Global prior N(0, I)
+
+#  是一个用于限制 KL 散度的参数。它的作用是防止 KL 散度过大，从而避免模型过度拟合。具体来说，free_nats 允许 KL 散度在一定范围内自由变化，而不会对模型的损失函数产生影响
 free_nats = torch.full((1,), args.free_nats, device=args.device)  # Allowed deviation in KL divergence
 print("models and planners are ready")
 
@@ -329,6 +362,8 @@ if args.test:
 
 
 # Training (and testing)
+# 这里是为了可持续化训练设置的一个循环，每次循环都会执行以下操作，每次训练都从上一次的训练结束的地方开始
+# todo 每一个episode都是游戏过程吗？
 for episode in tqdm(
     range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1
 ):
@@ -337,16 +372,25 @@ for episode in tqdm(
     model_modules = transition_model.modules + encoder.modules + observation_model.modules + reward_model.modules
 
     print("training loop")
+    # todo collect_interval的作用，是用来控制训练的次数的吗？
     for s in tqdm(range(args.collect_interval)):
         # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+        # 采集环境数据，格式：【【a0, b0, c0...Nchunk_size】，【a1, b1, c1】，【a2, b2, c2】，【a3, b3, c3】... [Abatch_size, Bbatch_size...]】
+        # shape (time, batch, features)
         observations, actions, rewards, nonterminals = D.sample(
             args.batch_size, args.chunk_size
         )  # Transitions start at time t = 0
         # Create initial belief and state for time t = 0
+        # todo 总结什么事信念状态
+        # 初始的隐状态（latent state），它也是一个高维的向量，用于表示环境的潜在状态。隐状态通过模型的状态转移网络（Transition Model）来更新，并结合当前的信念状态和动作，预测下一个隐状态。
         init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(
             args.batch_size, args.state_size, device=args.device
         )
         # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
+        # actions[:-1] 不传入最后一个动作
+        # observations[1:] 不传入第一个观察值
+        # nonterminals[:-1] 不传入最后一个是否结束
+        # bottle(encoder, (observations[1:],)): 将环境观察提取特征，shape变成（time, batch, embed_features）
         (
             beliefs,
             prior_states,

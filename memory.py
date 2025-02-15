@@ -8,7 +8,7 @@ class ExperienceReplay:
     def __init__(self, size, symbolic_env, observation_size, action_size, bit_depth, device):
         self.device = device
         self.symbolic_env = symbolic_env
-        self.size = size
+        self.size = size # 缓冲区大小
         self.observations = np.empty(
             (size, observation_size) if symbolic_env else (size, 3, 64, 64),
             dtype=np.float32 if symbolic_env else np.uint8,
@@ -16,7 +16,7 @@ class ExperienceReplay:
         self.actions = np.empty((size, action_size), dtype=np.float32)
         self.rewards = np.empty((size,), dtype=np.float32)
         self.nonterminals = np.empty((size, 1), dtype=np.float32)
-        self.idx = 0
+        self.idx = 0 # 当前存放的位置
         self.full = False  # Tracks if memory has been filled/all slots are valid
         self.steps, self.episodes = 0, 0  # Tracks how much experience has been used in total
         self.bit_depth = bit_depth
@@ -31,29 +31,49 @@ class ExperienceReplay:
         self.actions[self.idx] = action.numpy()
         self.rewards[self.idx] = reward
         self.nonterminals[self.idx] = not done
-        self.idx = (self.idx + 1) % self.size
-        self.full = self.full or self.idx == 0
+        self.idx = (self.idx + 1) % self.size # 
+        self.full = self.full or self.idx == 0 # Memory is full if current index crosses the buffer size
+        # 每次存放一次采集后，则步数+1，如果done为True，则episode+1
+        # todo 经验存放时连续的吗？
         self.steps, self.episodes = self.steps + 1, self.episodes + (1 if done else 0)
 
     # Returns an index for a valid single sequence chunk uniformly sampled from the memory
     def _sample_idx(self, L):
         valid_idx = False
         while not valid_idx:
+            # 计算采集的连续帧的起始索引随机位置
             idx = np.random.randint(0, self.size if self.full else self.idx - L)
+            # 计算结束为止，如果超过了缓冲区大小，则取余
             idxs = np.arange(idx, idx + L) % self.size
             valid_idx = not self.idx in idxs[1:]  # Make sure data does not cross the memory index
         return idxs
 
     def _retrieve_batch(self, idxs, n, L):
-        vec_idxs = idxs.transpose().reshape(-1)  # Unroll indices
+        '''
+        idxs: 包含n个L-length连续��的起始索引
+        n: batch size
+        L: sequence length; chunk size
+        '''
+        '''
+         [a0, a1, a2, a3],
+    [b0, b1, b2, b3],
+    [c0, c1, c2, c3],]
+
+    变成
+    [a0, b0, c0， a1, b1, c1， a2, b2, c2， a3, b3, c3],
+
+    最终将返回的结果为:
+    【【a0, b0, c0】，【a1, b1, c1】，【a2, b2, c2】，【a3, b3, c3】】
+        '''
+        vec_idxs = idxs.transpose().reshape(-1)  # Unroll indices，将n个L-length连续帧的起始索引展开为1维
         observations = torch.as_tensor(self.observations[vec_idxs].astype(np.float32))
         if not self.symbolic_env:
             preprocess_observation_(observations, self.bit_depth)  # Undo discretisation for visual observations
         return (
-            observations.reshape(L, n, *observations.shape[1:]),
-            self.actions[vec_idxs].reshape(L, n, -1),
-            self.rewards[vec_idxs].reshape(L, n),
-            self.nonterminals[vec_idxs].reshape(L, n, 1),
+            observations.reshape(L, n, *observations.shape[1:]), # 观察
+            self.actions[vec_idxs].reshape(L, n, -1), # 动作
+            self.rewards[vec_idxs].reshape(L, n), # 奖励
+            self.nonterminals[vec_idxs].reshape(L, n, 1), #是否结束
         )
 
     # Returns a batch of sequence chunks uniformly sampled from the memory
