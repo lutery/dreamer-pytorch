@@ -133,8 +133,9 @@ class TransitionModel(jit.ScriptModule):
                 _state if nonterminals is None else _state * nonterminals[t]
             )  # Mask if previous transition was terminal
             # Compute belief (deterministic hidden state)
-            # 根据状态（前一个状态）和动作（当前动作）提取特征
+            # 根据信念状态和动作提取特征 
             hidden = self.act_fn(self.fc_embed_state_action(torch.cat([_state, actions[t]], dim=1)))
+            #然后通过GRUCell进行更新 到后一个状态
             beliefs[t + 1] = self.rnn(hidden, beliefs[t])
             # Compute state prior by applying transition dynamics
             hidden = self.act_fn(self.fc_embed_belief_prior(beliefs[t + 1]))
