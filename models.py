@@ -101,7 +101,7 @@ class TransitionModel(jit.ScriptModule):
         prev_state: 上一个隐状态
         actions: 动作，没有传入最后一个动作，shape=(time - 1, batch, action_size)
         prev_belief: 上一个信念状态
-        observations: 观察值，没有传入第一个观察值，shape=(1:time， batch, observation_size)
+        observations: 观察值编码后的特征状态值，没有传入第一个观察值，shape=(1:time， batch, observation_size)
         nonterminals: 非终止状态没有传入最后一个中止符号，shape=(time - 1, batch, 1)
         Input: init_belief, init_state:  torch.Size([50, 200]) torch.Size([50, 30])
         Output: beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs
@@ -133,27 +133,35 @@ class TransitionModel(jit.ScriptModule):
                 _state if nonterminals is None else _state * nonterminals[t]
             )  # Mask if previous transition was terminal
             # Compute belief (deterministic hidden state)
-            # 根据信念状态和动作提取特征 
+            # 根据状态和动作提取特征 
             hidden = self.act_fn(self.fc_embed_state_action(torch.cat([_state, actions[t]], dim=1)))
-            #然后通过GRUCell进行更新 到后一个状态
+            #然后通过GRUCell进行更新 到后一个信念状态
             beliefs[t + 1] = self.rnn(hidden, beliefs[t])
             # Compute state prior by applying transition dynamics
+            # 通过信念状态提取特征
             hidden = self.act_fn(self.fc_embed_belief_prior(beliefs[t + 1]))
+            # 计算先验均值和标准差
             prior_means[t + 1], _prior_std_dev = torch.chunk(self.fc_state_prior(hidden), 2, dim=1)
             prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + self.min_std_dev
+            # 根据先验均值和标准差采样得到下一个先验状态，使用随机噪声采样
             prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
             if observations is not None:
                 # Compute state posterior by applying transition dynamics and using current observation
                 t_ = t - 1  # Use t_ to deal with different time indexing for observations
+                # 根据上一个观察值（因为传入的观察和动作差一个时间单位），和后一个信念状态提取特征
                 hidden = self.act_fn(
                     self.fc_embed_belief_posterior(torch.cat([beliefs[t + 1], observations[t_ + 1]], dim=1))
                 )
+                # 根据提取的观察特征计算后验均值和标准差
                 posterior_means[t + 1], _posterior_std_dev = torch.chunk(self.fc_state_posterior(hidden), 2, dim=1)
                 posterior_std_devs[t + 1] = F.softplus(_posterior_std_dev) + self.min_std_dev
                 posterior_states[t + 1] = posterior_means[t + 1] + posterior_std_devs[t + 1] * torch.randn_like(
                     posterior_means[t + 1]
                 )
+            #通过以上不断循环，得到了每个时间步的信念状态、先验状态、先验均值、先验标准差、后验状态、后验均值和后验标准差
         # Return new hidden states
+        # 根据以上可知0时刻基本都是没有的，所以返回的时候从1开始
+        # 依次返回信念状态、先验状态、先验均值、先验标准差、后验状态、后验均值和后验标准差，均是和动作以及是否结束结合计算
         hidden = [
             torch.stack(beliefs[1:], dim=0),
             torch.stack(prior_states[1:], dim=0),
@@ -161,6 +169,7 @@ class TransitionModel(jit.ScriptModule):
             torch.stack(prior_std_devs[1:], dim=0),
         ]
         if observations is not None:
+            # 如果有观察值，则返回后验状态、后验均值和后验标准差，均是和观察值结合计算
             hidden += [
                 torch.stack(posterior_states[1:], dim=0),
                 torch.stack(posterior_means[1:], dim=0),

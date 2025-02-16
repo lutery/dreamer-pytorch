@@ -68,6 +68,11 @@ def imagine_ahead(prev_state, prev_belief, policy, transition_model, planning_ho
     Input: current state (posterior), current belief (hidden), policy, transition_model  # torch.Size([50, 30]) torch.Size([50, 200])
     Output: generated trajectory of features includes beliefs, prior_states, prior_means, prior_std_devs
             torch.Size([49, 50, 200]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30])
+
+    imagine_ahead 是一个函数，用于使用动态模型、演员和评论家绘制想象轨迹。  
+    输入：当前状态（后验），当前信念（隐藏），策略，转移模型  # torch.Size([50, 30]) torch.Size([50, 200])  
+    输出：生成的特征轨迹，包括信念、先验状态、先验均值、先验标准差  ，而这里不同的就是传入的动作事动作网络预测的动作，和之前是使用真实的动作不同
+    torch.Size([49, 50, 200]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30])
     '''
     flatten = lambda x: x.view([-1] + list(x.size()[2:]))
     prev_belief = flatten(prev_belief)
@@ -86,11 +91,16 @@ def imagine_ahead(prev_state, prev_belief, policy, transition_model, planning_ho
     # Loop over time sequence
     for t in range(T - 1):
         _state = prior_states[t]
+        # 结合信念状态（包含先验前一个动作的特征）和后验状态（传入的事后验状态，包含环境观察的特征）todo
+        # 得到预测的动作
         actions = policy.get_action(beliefs[t].detach(), _state.detach())
         # Compute belief (deterministic hidden state)
+        # 后验状态结合预测的动作提取特征
         hidden = transition_model.act_fn(transition_model.fc_embed_state_action(torch.cat([_state, actions], dim=1)))
+        # 计算得到下一个信念状态
         beliefs[t + 1] = transition_model.rnn(hidden, beliefs[t])
         # Compute state prior by applying transition dynamics
+        # 根据信念状态计算先验状态
         hidden = transition_model.act_fn(transition_model.fc_embed_belief_prior(beliefs[t + 1]))
         prior_means[t + 1], _prior_std_dev = torch.chunk(transition_model.fc_state_prior(hidden), 2, dim=1)
         prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + transition_model.min_std_dev
@@ -109,16 +119,23 @@ def imagine_ahead(prev_state, prev_belief, policy, transition_model, planning_ho
 def lambda_return(imged_reward, value_pred, bootstrap, discount=0.99, lambda_=0.95):
     # Setting lambda=1 gives a discounted Monte Carlo return.
     # Setting lambda=0 gives a fixed 1-step return.
+    # bootstrap=value_predp[-1]
+    # next_value相当于吧value_pred向后移动一位，然后最后一个值用bootstrap填充
     next_values = torch.cat([value_pred[1:], bootstrap[None]], 0)
+    # 得到每一个step的discount
     discount_tensor = discount * torch.ones_like(imged_reward)  # pcont
+    # 这里有点像bellman公式了，计算出来的是每一步的return，在PPO中可以看到
+    # （1 - lambda_）平衡蒙特卡罗回报和时间差分（TD）回报
     inputs = imged_reward + discount_tensor * next_values * (1 - lambda_)
     last = bootstrap
     indices = reversed(range(len(inputs)))
     outputs = []
+    # 倒序遍历，这边是在模仿轨迹中计算return
     for index in indices:
         inp, disc = inputs[index], discount_tensor[index]
         last = inp + disc * lambda_ * last
         outputs.append(last)
+    # 将顺序反转，变回正序
     outputs = list(reversed(outputs))
     outputs = torch.stack(outputs, 0)
     returns = outputs
